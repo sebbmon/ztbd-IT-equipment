@@ -1,0 +1,67 @@
+version: '3.8'
+
+services:
+  # 1. postgres
+  postgres:
+    image: postgres:15
+    container_name: it_postgres
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: password
+      POSTGRES_DB: it_equipment
+    ports:
+      - "5432:5432"
+    volumes:
+      - pg_data:/var/lib/postgresql/data
+      - ./data:/csv_data
+    restart: unless-stopped
+
+  # 2. mysql
+  mysql:
+    image: mysql:8.0
+    container_name: it_mysql
+    environment:
+      MYSQL_ROOT_PASSWORD: password
+      MYSQL_DATABASE: it_equipment
+      MYSQL_USER: admin
+      MYSQL_PASSWORD: password
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+      - ./data:/csv_data
+    restart: unless-stopped
+
+  # 3. mongo
+  mongo:
+    image: mongo:6.0
+    container_name: it_mongo
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: password
+      MONGO_INITDB_DATABASE: it_equipment
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo_data:/data/db
+      - ./data:/csv_data
+    restart: unless-stopped
+
+  # 4. cassandra
+  cassandra:
+    image: cassandra:4.1
+    container_name: it_cassandra
+    environment:
+      CASSANDRA_CLUSTER_NAME: "ITCluster"
+    ports:
+      - "9042:9042"
+    volumes:
+      - cassandra_data:/var/lib/cassandra
+      - ./data:/csv_data
+    restart: unless-stopped
+
+volumes:
+  pg_data:
+  mysql_data:
+  mongo_data:
+  cassandra_data:
