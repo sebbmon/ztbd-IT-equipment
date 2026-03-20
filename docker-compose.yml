@@ -20,6 +20,7 @@ services:
   mysql:
     image: mysql:8.0
     container_name: it_mysql
+    command: --local-infile=1
     environment:
       MYSQL_ROOT_PASSWORD: password
       MYSQL_DATABASE: it_equipment
