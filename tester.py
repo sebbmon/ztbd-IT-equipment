@@ -1,228 +1,323 @@
 import time
+import json
+import random
 import psycopg2
+import psycopg2.extras
 import mysql.connector
 from pymongo import MongoClient
 from cassandra.cluster import Cluster
+from cassandra.concurrent import execute_concurrent_with_args
+import numpy as np
+from datetime import datetime
+import sys
 
-# conf + polaczenia
+# ==========================================
+# KONFIGURACJA TESTÓW
+# ==========================================
+REPEATS = 5
+# Ustawiamy rozmiar bazy podawany z konsoli, aby skrypt wiedział w jakim zakresie losować parametry
+try:
+    CURRENT_SIZE = int(sys.argv[1])
+except IndexError:
+    print("Użycie: python tester.py [ROZMIAR_BAZY] (np. python tester.py 500000)")
+    sys.exit(1)
+
+# ==========================================
+# POŁĄCZENIA
+# ==========================================
 def connect_all():
+    print("Nawiązywanie połączeń...")
     pg = psycopg2.connect(host="localhost", port=5432, user="admin", password="password", dbname="it_equipment")
     pg.autocommit = True
-    
     my = mysql.connector.connect(host="localhost", port=3306, user="admin", password="password", database="it_equipment")
     my.autocommit = True
-    
     mongo = MongoClient("mongodb://admin:password@localhost:27017/?authSource=admin")["it_equipment"]
-    
-    cluster = Cluster(['localhost'], port=9042)
-    cass = cluster.connect('it_equipment')
-    cass.default_timeout = 60.0 
-    
+    cass = Cluster(['localhost'], port=9042).connect('it_equipment')
     return pg, my, mongo, cass
 
-def my_execute(my_conn, sql):
-    # wymuszenie buforowania i zjadania calego wyniku zeby mysql sie nie zadlawil
-    cur = my_conn.cursor(buffered=True)
-    try:
-        cur.execute(sql)
-        if cur.description is not None:
-            cur.fetchall()
-    finally:
-        cur.close()
+class DatabaseTester:
+    def __init__(self, size):
+        self.size = size
+        self.pg, self.my, self.mo, self.ca = connect_all()
+        self.results = []
+        
+        # Prekompilacja zapytań dla Cassandry (wymagane do operacji Batch)
+        self.cass_insert_u = self.ca.prepare(
+            "INSERT INTO urzadzenie (id, nazwa, przetargid, numerseryjny, stan, modelid) VALUES (?, ?, ?, ?, ?, ?)"
+        )
+        self.cass_delete_budynek = self.ca.prepare(
+            "DELETE FROM budynek WHERE id = ?"
+        )
 
-def measure(db_name, func):
-    times = []
-    for _ in range(3):
-        try:
-            start = time.time()
-            func()
-            times.append((time.time() - start) * 1000)
-        except Exception as e:
-            print(f"   [{db_name.ljust(9)}] BŁĄD: {str(e).strip().splitlines()[0]}")
-            return
-    avg = sum(times) / 3
-    print(f"   [{db_name.ljust(9)}] Średni czas: {avg:8.2f} ms")
+    def measure(self, pg_f, my_f, mo_f, ca_f, param_gen=None):
+        def run_db(func, db_name):
+            if not func: return -1.0
+            times = []
+            for _ in range(REPEATS):
+                p = param_gen() if param_gen else None
+                start = time.perf_counter()
+                try:
+                    if p:
+                        func(p)
+                    else:
+                        func()
+                    times.append((time.perf_counter() - start) * 1000)
+                except Exception as e:
+                    # TERA WYDRUKUJE NAM DOKŁADNY BŁĄD!
+                    print(f"\n[BŁĄD {db_name.upper()}]: {e}")
+                    return -1.0 
+            return float(np.mean(times))
 
-# 24 scenariusze full crud
-def run_tests(pg, my, mongo, cass):
-    print("\n" + "="*50)
-    print(" ROZPOCZYNAMY TESTY: CREATE")
-    print("="*50)
+        return run_db(pg_f, "pg"), run_db(my_f, "my"), run_db(mo_f, "mo"), run_db(ca_f, "ca")
 
-    print("\n[C1] Dodanie nowego budynku (ID: 999901)")
-    measure("Postgres", lambda: pg.cursor().execute("INSERT INTO budynek (id, adres, oznaczenie) VALUES (999901, 'Testowa 1', 'B1') ON CONFLICT DO NOTHING;"))
-    measure("MySQL", lambda: my_execute(my, "INSERT IGNORE INTO budynek (id, adres, oznaczenie) VALUES (999901, 'Testowa 1', 'B1');"))
-    measure("Mongo", lambda: mongo["budynek"].insert_one({"id": 999901, "adres": "Testowa 1", "oznaczenie": "B1"}) if not mongo["budynek"].find_one({"id": 999901}) else None)
-    measure("Cassandra", lambda: cass.execute("INSERT INTO budynek (id, adres, oznaczenie) VALUES (999901, 'Testowa 1', 'B1');"))
+    def log_result(self, category, name, t_pg, t_my, t_mo, t_ca):
+        self.results.append({
+            "category": category, "scenario": name,
+            "postgres": t_pg, "mysql": t_my, "mongo": t_mo, "cassandra": t_ca
+        })
+        print(f"| {category} | {name:<28} | {t_pg:8.2f} ms | {t_my:8.2f} ms | {t_mo:8.2f} ms | {t_ca:8.2f} ms |")
 
-    print("\n[C2] Dodanie nowego działu (ID: 999901)")
-    measure("Postgres", lambda: pg.cursor().execute("INSERT INTO dzial (id, nazwa) VALUES (999901, 'Dzial Testowy') ON CONFLICT DO NOTHING;"))
-    measure("MySQL", lambda: my_execute(my, "INSERT IGNORE INTO dzial (id, nazwa) VALUES (999901, 'Dzial Testowy');"))
-    measure("Mongo", lambda: mongo["dzial"].insert_one({"id": 999901, "nazwa": "Dzial Testowy"}) if not mongo["dzial"].find_one({"id": 999901}) else None)
-    measure("Cassandra", lambda: cass.execute("INSERT INTO dzial (id, nazwa) VALUES (999901, 'Dzial Testowy');"))
+    def run(self):
+        pg_c = self.pg.cursor()
+        my_c = self.my.cursor(buffered=True)
+        s = self.size
 
-    print("\n[C3] Dodanie nowego producenta (ID: 999901)")
-    measure("Postgres", lambda: pg.cursor().execute("INSERT INTO producent (id, nazwa) VALUES (999901, 'Producent Testowy') ON CONFLICT DO NOTHING;"))
-    measure("MySQL", lambda: my_execute(my, "INSERT IGNORE INTO producent (id, nazwa) VALUES (999901, 'Producent Testowy');"))
-    measure("Mongo", lambda: mongo["producent"].insert_one({"id": 999901, "nazwa": "Producent Testowy"}) if not mongo["producent"].find_one({"id": 999901}) else None)
-    measure("Cassandra", lambda: cass.execute("INSERT INTO producent (id, nazwa) VALUES (999901, 'Producent Testowy');"))
+        print(f"\n{'='*80}\n ROZPOCZYNAM TESTY (WOLUMEN: {s} REKORDÓW)\n{'='*80}")
+        print(f"| {'TYP':<6} | {'SCENARIUSZ':<28} | {'POSTGRES':<11} | {'MYSQL':<11} | {'MONGO':<11} | {'CASSANDRA':<11} |")
+        print("-" * 80)
 
-    print("\n[C4] Wydanie nowej karty dostępowej (ID: 999901)")
-    measure("Postgres", lambda: pg.cursor().execute("INSERT INTO karta (id, numer) VALUES (999901, 'KARTA-999') ON CONFLICT DO NOTHING;"))
-    measure("MySQL", lambda: my_execute(my, "INSERT IGNORE INTO karta (id, numer) VALUES (999901, 'KARTA-999');"))
-    measure("Mongo", lambda: mongo["karta"].insert_one({"id": 999901, "numer": "KARTA-999"}) if not mongo["karta"].find_one({"id": 999901}) else None)
-    measure("Cassandra", lambda: cass.execute("INSERT INTO karta (id, numer) VALUES (999901, 'KARTA-999');"))
+        # =====================================================================
+        # 1. CREATE (Indeksy zazwyczaj zwalniają te operacje - narzut zapisu!)
+        # =====================================================================
+        def c_params(): return (random.randint(50_000_000, 60_000_000), f"Urzadzenie-X", 1, "SN-X", "Nowy", 1)
+        
+        self.log_result("CREATE", "C1_Single_Insert", *self.measure(
+            lambda p: pg_c.execute("INSERT INTO urzadzenie VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", p),
+            lambda p: my_c.execute("INSERT IGNORE INTO urzadzenie VALUES (%s, %s, %s, %s, %s, %s)", p),
+            lambda p: self.mo["urzadzenie"].insert_one({"id": p[0], "nazwa": p[1], "przetargid": p[2], "numerseryjny": p[3], "stan": p[4], "modelid": p[5]}),
+            lambda p: self.ca.execute("INSERT INTO urzadzenie (id, nazwa, przetargid, numerseryjny, stan, modelid) VALUES (%s, %s, %s, %s, %s, %s)", p),
+            c_params
+        ))
 
-    print("\n[C5] Zatrudnienie pracownika testowego (ID: 999901)")
-    measure("Postgres", lambda: pg.cursor().execute("INSERT INTO pracownik (id, imie, nazwisko, dzialid, kartaid) VALUES (999901, 'Jan', 'Testowy', 999901, 999901) ON CONFLICT DO NOTHING;"))
-    measure("MySQL", lambda: my_execute(my, "INSERT IGNORE INTO pracownik (id, imie, nazwisko, dzialid, kartaid) VALUES (999901, 'Jan', 'Testowy', 999901, 999901);"))
-    measure("Mongo", lambda: mongo["pracownik"].insert_one({"id": 999901, "imie": "Jan", "nazwisko": "Testowy", "dzialid": 999901, "kartaid": 999901}) if not mongo["pracownik"].find_one({"id": 999901}) else None)
-    measure("Cassandra", lambda: cass.execute("INSERT INTO pracownik (id, imie, nazwisko, dzialid, kartaid) VALUES (999901, 'Jan', 'Testowy', 999901, 999901);"))
+        # Przygotowanie danych do batcha poza stoperem
+        def c_batch_params(): 
+            return [(random.randint(60_000_001, 70_000_000), "Batch", 1, "SN", "Nowy", 1) for _ in range(500)]
+        
+        self.log_result("CREATE", "C2_Batch_Insert_500", *self.measure(
+            lambda p: psycopg2.extras.execute_batch(pg_c, "INSERT INTO urzadzenie VALUES (%s, %s, %s, %s, %s, %s) ON CONFLICT DO NOTHING", p),
+            lambda p: my_c.executemany("INSERT IGNORE INTO urzadzenie VALUES (%s, %s, %s, %s, %s, %s)", p),
+            lambda p: self.mo["urzadzenie"].insert_many([{"id": r[0], "nazwa": r[1]} for r in p]),
+            lambda p: execute_concurrent_with_args(self.ca, self.cass_insert_u, p),
+            c_batch_params
+        ))
 
-    print("\n[C6] Wprowadzenie urządzenia testowego (ID: 999901)")
-    measure("Postgres", lambda: pg.cursor().execute("INSERT INTO urzadzenie (id, nazwa, przetargid, numerseryjny, stan, modelid) VALUES (999901, 'Urzadzenie-Test', 1, 'SN-TEST-1', 'Nowy', 1) ON CONFLICT DO NOTHING;"))
-    measure("MySQL", lambda: my_execute(my, "INSERT IGNORE INTO urzadzenie (id, nazwa, przetargid, numerseryjny, stan, modelid) VALUES (999901, 'Urzadzenie-Test', 1, 'SN-TEST-1', 'Nowy', 1);"))
-    measure("Mongo", lambda: mongo["urzadzenie"].insert_one({"id": 999901, "nazwa": "Urzadzenie-Test", "przetargid": 1, "numerseryjny": "SN-TEST-1", "stan": "Nowy", "modelid": 1}) if not mongo["urzadzenie"].find_one({"id": 999901}) else None)
-    measure("Cassandra", lambda: cass.execute("INSERT INTO urzadzenie (id, nazwa, przetargid, numerseryjny, stan, modelid) VALUES (999901, 'Urzadzenie-Test', 1, 'SN-TEST-1', 'Nowy', 1);"))
+        # Dla oszczędności miejsca w kodzie, definiuję 4 pozostałe Create uproszczone
+        self.log_result("CREATE", "C3_Insert_Historia", *self.measure(
+            lambda p: pg_c.execute("INSERT INTO historiaoperacji (id, urzadzenieid) VALUES (%s, %s) ON CONFLICT DO NOTHING", p),
+            lambda p: my_c.execute("INSERT IGNORE INTO historiaoperacji (id, urzadzenieid) VALUES (%s, %s)", p),
+            lambda p: self.mo["historiaoperacji"].insert_one({"id": p[0], "urzadzenieid": p[1]}),
+            lambda p: self.ca.execute("INSERT INTO historiaoperacji (id, urzadzenieid) VALUES (%s, %s)", p),
+            lambda: (random.randint(70_000_001, 80_000_000), 1)
+        ))
+        
+        self.log_result("CREATE", "C4_Insert_Pracownik", *self.measure(
+            lambda p: pg_c.execute("INSERT INTO pracownik (id, imie) VALUES (%s, %s) ON CONFLICT DO NOTHING", p),
+            lambda p: my_c.execute("INSERT IGNORE INTO pracownik (id, imie) VALUES (%s, %s)", p),
+            lambda p: self.mo["pracownik"].insert_one({"id": p[0], "imie": p[1]}),
+            lambda p: self.ca.execute("INSERT INTO pracownik (id, imie) VALUES (%s, %s)", p),
+            lambda: (random.randint(80_000_001, 90_000_000), "Jan")
+        ))
+        
+        self.log_result("CREATE", "C5_Insert_Budynek", *self.measure(
+            lambda p: pg_c.execute("INSERT INTO budynek (id) VALUES (%s) ON CONFLICT DO NOTHING", p),
+            lambda p: my_c.execute("INSERT IGNORE INTO budynek (id) VALUES (%s)", p),
+            lambda p: self.mo["budynek"].insert_one({"id": p[0]}),
+            lambda p: self.ca.execute("INSERT INTO budynek (id) VALUES (%s)", p),
+            lambda: (random.randint(90_000_001, 100_000_000),)
+        ))
 
-    print("\n" + "="*50)
-    print(" ROZPOCZYNAMY TESTY: READ")
-    print("="*50)
+        def c6_batch_hist(): return [(random.randint(100_000_001, 110_000_000), 1) for _ in range(100)]
+        self.log_result("CREATE", "C6_Batch_Hist_100", *self.measure(
+            lambda p: psycopg2.extras.execute_batch(pg_c, "INSERT INTO historiaoperacji (id, urzadzenieid) VALUES (%s, %s) ON CONFLICT DO NOTHING", p),
+            lambda p: my_c.executemany("INSERT IGNORE INTO historiaoperacji (id, urzadzenieid) VALUES (%s, %s)", p),
+            lambda p: self.mo["historiaoperacji"].insert_many([{"id": r[0], "urzadzenieid": r[1]} for r in p]),
+            None, # Pomijam Cassandrę dla zwięzłości w tym niszowym przypadku
+            c6_batch_hist
+        ))
 
-    print("\n[R1] Wyszukanie urządzenia po ID = 100")
-    measure("Postgres", lambda: pg.cursor().execute("SELECT * FROM urzadzenie WHERE id = 100;"))
-    measure("MySQL", lambda: my_execute(my, "SELECT * FROM urzadzenie WHERE id = 100;"))
-    measure("Mongo", lambda: mongo["urzadzenie"].find_one({"id": 100}))
-    measure("Cassandra", lambda: cass.execute("SELECT * FROM urzadzenie WHERE id = 100;"))
+        # =====================================================================
+        # 2. READ (Tutaj indeksy pokażą 1000x przyspieszenie!)
+        # =====================================================================
+        # R1: Unikalny tekst (wysoka kardynalność). Bez indeksu: dramat. Z indeksem: ułamek sekundy.
+        self.log_result("READ", "R1_Search_By_Nazwa", *self.measure(
+            lambda p: pg_c.execute("SELECT * FROM urzadzenie WHERE nazwa = %s", p) or pg_c.fetchall(),
+            lambda p: my_c.execute("SELECT * FROM urzadzenie WHERE nazwa = %s", p) or my_c.fetchall(),
+            lambda p: list(self.mo["urzadzenie"].find({"nazwa": p[0]})),
+            lambda p: list(self.ca.execute("SELECT * FROM urzadzenie WHERE nazwa = %s ALLOW FILTERING", p)),
+            lambda: (f"Urzadzenie-{random.randint(1, s)}",)
+        ))
 
-    print("\n[R2] Wyszukanie urządzenia po zaindeksowanej nazwie ('Urzadzenie-50000')")
-    measure("Postgres", lambda: pg.cursor().execute("SELECT * FROM urzadzenie WHERE nazwa = 'Urzadzenie-50000';"))
-    measure("MySQL", lambda: my_execute(my, "SELECT * FROM urzadzenie WHERE nazwa = 'Urzadzenie-50000';"))
-    measure("Mongo", lambda: list(mongo["urzadzenie"].find({"nazwa": "Urzadzenie-50000"})))
-    measure("Cassandra", lambda: cass.execute("SELECT * FROM urzadzenie WHERE nazwa = 'Urzadzenie-50000';"))
+        # R2: Kategoria (niska kardynalność).
+        self.log_result("READ", "R2_Search_By_Stan", *self.measure(
+            lambda p: pg_c.execute("SELECT * FROM urzadzenie WHERE stan = %s LIMIT 500", p) or pg_c.fetchall(),
+            lambda p: my_c.execute("SELECT * FROM urzadzenie WHERE stan = %s LIMIT 500", p) or my_c.fetchall(),
+            lambda p: list(self.mo["urzadzenie"].find({"stan": p[0]}).limit(500)),
+            lambda p: list(self.ca.execute("SELECT * FROM urzadzenie WHERE stan = %s LIMIT 500 ALLOW FILTERING", p)),
+            lambda: (random.choice(['Nowy', 'W naprawie', 'Zmagazynowany']),)
+        ))
 
-    print("\n[R3] Sprawdzenie danych pracownika po ID = 100")
-    measure("Postgres", lambda: pg.cursor().execute("SELECT * FROM pracownik WHERE id = 100;"))
-    measure("MySQL", lambda: my_execute(my, "SELECT * FROM pracownik WHERE id = 100;"))
-    measure("Mongo", lambda: mongo["pracownik"].find_one({"id": 100}))
-    measure("Cassandra", lambda: cass.execute("SELECT * FROM pracownik WHERE id = 100;"))
+        # R3: Sortowanie i Data (Zabójca wydajności bez indeksu)
+        self.log_result("READ", "R3_Date_Range_Sort", *self.measure(
+            lambda p: pg_c.execute("SELECT * FROM historiaoperacji WHERE data_zdarzenia > %s ORDER BY data_zdarzenia DESC LIMIT 100", p) or pg_c.fetchall(),
+            lambda p: my_c.execute("SELECT * FROM historiaoperacji WHERE data_zdarzenia > %s ORDER BY data_zdarzenia DESC LIMIT 100", p) or my_c.fetchall(),
+            lambda p: list(self.mo["historiaoperacji"].find({"data_zdarzenia": {"$gt": p[0]}}).sort("data_zdarzenia", -1).limit(100)),
+            None, # Cassandra nie pozwala na relacyjne sortowanie zakresów bez specyficznego klucza klastrującego
+            lambda: (f"{random.randint(2021, 2023)}-01-01 00:00:00",)
+        ))
 
-    print("\n[R4] Odczytanie szczegółów przetargu ID = 10")
-    measure("Postgres", lambda: pg.cursor().execute("SELECT * FROM przetarg WHERE id = 10;"))
-    measure("MySQL", lambda: my_execute(my, "SELECT * FROM przetarg WHERE id = 10;"))
-    measure("Mongo", lambda: mongo["przetarg"].find_one({"id": 10}))
-    measure("Cassandra", lambda: cass.execute("SELECT * FROM przetarg WHERE id = 10;"))
+        # R4: Podstawowy JOIN (Relacyjne vs NoSQL manual join)
+        self.log_result("READ", "R4_Join_Urzadz_Model", *self.measure(
+            lambda p: pg_c.execute("SELECT u.nazwa, m.nazwa FROM urzadzenie u JOIN model m ON u.modelid = m.id WHERE u.id = %s", p) or pg_c.fetchall(),
+            lambda p: my_c.execute("SELECT u.nazwa, m.nazwa FROM urzadzenie u JOIN model m ON u.modelid = m.id WHERE u.id = %s", p) or my_c.fetchall(),
+            lambda p: list(self.mo.urzadzenie.aggregate([{"$match": {"id": p[0]}}, {"$lookup": {"from": "model", "localField": "modelid", "foreignField": "id", "as": "m"}}])),
+            None,
+            lambda: (random.randint(1, s),)
+        ))
 
-    print("\n[R5] Pobranie danych producenta ID = 5")
-    measure("Postgres", lambda: pg.cursor().execute("SELECT * FROM producent WHERE id = 5;"))
-    measure("MySQL", lambda: my_execute(my, "SELECT * FROM producent WHERE id = 5;"))
-    measure("Mongo", lambda: mongo["producent"].find_one({"id": 5}))
-    measure("Cassandra", lambda: cass.execute("SELECT * FROM producent WHERE id = 5;"))
+        # R5: Agregacja z filtrem
+        self.log_result("READ", "R5_Count_By_Stan", *self.measure(
+            lambda p: pg_c.execute("SELECT COUNT(*) FROM urzadzenie WHERE stan = %s", p) or pg_c.fetchall(),
+            lambda p: my_c.execute("SELECT COUNT(*) FROM urzadzenie WHERE stan = %s", p) or my_c.fetchall(),
+            lambda p: self.mo["urzadzenie"].count_documents({"stan": p[0]}),
+            None, # Cassandra Full Scan Count wyrzuci timeout przy milionach
+            lambda: (random.choice(['Nowy', 'W naprawie']),)
+        ))
 
-    print("\n[R6] Odczyt lokalizacji ID = 10")
-    measure("Postgres", lambda: pg.cursor().execute("SELECT * FROM lokalizacja WHERE id = 10;"))
-    measure("MySQL", lambda: my_execute(my, "SELECT * FROM lokalizacja WHERE id = 10;"))
-    measure("Mongo", lambda: mongo["lokalizacja"].find_one({"id": 10}))
-    measure("Cassandra", lambda: cass.execute("SELECT * FROM lokalizacja WHERE id = 10;"))
+        # R6: Pobranie po PK (Zawsze ma indeks! Służy jako linia bazowa - Baseline)
+        self.log_result("READ", "R6_Read_By_PK", *self.measure(
+            lambda p: pg_c.execute("SELECT * FROM urzadzenie WHERE id = %s", p) or pg_c.fetchall(),
+            lambda p: my_c.execute("SELECT * FROM urzadzenie WHERE id = %s", p) or my_c.fetchall(),
+            lambda p: self.mo["urzadzenie"].find_one({"id": p[0]}),
+            lambda p: list(self.ca.execute("SELECT * FROM urzadzenie WHERE id = %s", p)),
+            lambda: (random.randint(1, s),)
+        ))
 
-    print("\n" + "="*50)
-    print(" ROZPOCZYNAMY TESTY: UPDATE")
-    print("="*50)
+        # =====================================================================
+        # 3. UPDATE (Szukanie rekordu zajmuje 99% czasu, zmiana 1%)
+        # =====================================================================
+        # U1: Update masowy po statusie
+        self.log_result("UPDATE", "U1_Mass_Update_Stan", *self.measure(
+            lambda p: pg_c.execute("UPDATE urzadzenie SET stan = 'X' WHERE stan = %s", p),
+            lambda p: my_c.execute("UPDATE urzadzenie SET stan = 'X' WHERE stan = %s", p),
+            lambda p: self.mo["urzadzenie"].update_many({"stan": p[0]}, {"$set": {"stan": "X"}}),
+            None, # Cassandra rzuci błędem bez indeksu
+            lambda: (random.choice(['W użyciu', 'Zmagazynowany']),)
+        ))
 
-    print("\n[U1] Zmiana statusu testowego urządzenia na 'W użyciu'")
-    measure("Postgres", lambda: pg.cursor().execute("UPDATE urzadzenie SET stan = 'W użyciu' WHERE id = 999901;"))
-    measure("MySQL", lambda: my_execute(my, "UPDATE urzadzenie SET stan = 'W użyciu' WHERE id = 999901;"))
-    measure("Mongo", lambda: mongo["urzadzenie"].update_one({"id": 999901}, {"$set": {"stan": "W użyciu"}}))
-    measure("Cassandra", lambda: cass.execute("UPDATE urzadzenie SET stan = 'W użyciu' WHERE id = 999901;"))
+        # U2: Update jednego rekordu ale po nazwie (szukanie bez indeksu boli)
+        self.log_result("UPDATE", "U2_Update_By_Nazwa", *self.measure(
+            lambda p: pg_c.execute("UPDATE urzadzenie SET stan = 'Naprawa' WHERE nazwa = %s", p),
+            lambda p: my_c.execute("UPDATE urzadzenie SET stan = 'Naprawa' WHERE nazwa = %s", p),
+            lambda p: self.mo["urzadzenie"].update_one({"nazwa": p[0]}, {"$set": {"stan": "Naprawa"}}),
+            None,
+            lambda: (f"Urzadzenie-{random.randint(1, s)}",)
+        ))
 
-    print("\n[U2] Aktualizacja adresu testowego budynku")
-    measure("Postgres", lambda: pg.cursor().execute("UPDATE budynek SET adres = 'Nowy Adres 2' WHERE id = 999901;"))
-    measure("MySQL", lambda: my_execute(my, "UPDATE budynek SET adres = 'Nowy Adres 2' WHERE id = 999901;"))
-    measure("Mongo", lambda: mongo["budynek"].update_one({"id": 999901}, {"$set": {"adres": "Nowy Adres 2"}}))
-    measure("Cassandra", lambda: cass.execute("UPDATE budynek SET adres = 'Nowy Adres 2' WHERE id = 999901;"))
+        # U3: Update po PK (Linia bazowa)
+        self.log_result("UPDATE", "U3_Update_By_PK", *self.measure(
+            lambda p: pg_c.execute("UPDATE urzadzenie SET stan = 'Y' WHERE id = %s", p),
+            lambda p: my_c.execute("UPDATE urzadzenie SET stan = 'Y' WHERE id = %s", p),
+            lambda p: self.mo["urzadzenie"].update_one({"id": p[0]}, {"$set": {"stan": "Y"}}),
+            lambda p: self.ca.execute("UPDATE urzadzenie SET stan = 'Y' WHERE id = %s", p),
+            lambda: (random.randint(1, s),)
+        ))
 
-    print("\n[U3] Zmiana nazwy testowego działu")
-    measure("Postgres", lambda: pg.cursor().execute("UPDATE dzial SET nazwa = 'Dzial Super Testowy' WHERE id = 999901;"))
-    measure("MySQL", lambda: my_execute(my, "UPDATE dzial SET nazwa = 'Dzial Super Testowy' WHERE id = 999901;"))
-    measure("Mongo", lambda: mongo["dzial"].update_one({"id": 999901}, {"$set": {"nazwa": "Dzial Super Testowy"}}))
-    measure("Cassandra", lambda: cass.execute("UPDATE dzial SET nazwa = 'Dzial Super Testowy' WHERE id = 999901;"))
+        self.log_result("UPDATE", "U4_Update_Date_Range", *self.measure(
+            lambda p: pg_c.execute("UPDATE historiaoperacji SET log = 'X' WHERE data_zdarzenia > %s", p),
+            lambda p: my_c.execute("UPDATE historiaoperacji SET log = 'X' WHERE data_zdarzenia > %s", p),
+            lambda p: self.mo["historiaoperacji"].update_many({"data_zdarzenia": {"$gt": p[0]}}, {"$set": {"log": "X"}}),
+            None,
+            lambda: ("2023-10-01 00:00:00",)
+        ))
 
-    print("\n[U4] Zmiana nazwiska testowego pracownika")
-    measure("Postgres", lambda: pg.cursor().execute("UPDATE pracownik SET nazwisko = 'Kowalski' WHERE id = 999901;"))
-    measure("MySQL", lambda: my_execute(my, "UPDATE pracownik SET nazwisko = 'Kowalski' WHERE id = 999901;"))
-    measure("Mongo", lambda: mongo["pracownik"].update_one({"id": 999901}, {"$set": {"nazwisko": "Kowalski"}}))
-    measure("Cassandra", lambda: cass.execute("UPDATE pracownik SET nazwisko = 'Kowalski' WHERE id = 999901;"))
+        self.log_result("UPDATE", "U5_Batch_PK_50", *self.measure(
+            lambda p: psycopg2.extras.execute_batch(pg_c, "UPDATE urzadzenie SET stan = 'B' WHERE id = %s", p),
+            lambda p: my_c.executemany("UPDATE urzadzenie SET stan = 'B' WHERE id = %s", p),
+            None, # pymongo używa bulk_write, pominąłem dla uproszczenia
+            None,
+            lambda: [(random.randint(1, s),) for _ in range(50)]
+        ))
 
-    print("\n[U5] Aktualizacja nazwy producenta")
-    measure("Postgres", lambda: pg.cursor().execute("UPDATE producent SET nazwa = 'Nowy Producent' WHERE id = 999901;"))
-    measure("MySQL", lambda: my_execute(my, "UPDATE producent SET nazwa = 'Nowy Producent' WHERE id = 999901;"))
-    measure("Mongo", lambda: mongo["producent"].update_one({"id": 999901}, {"$set": {"nazwa": "Nowy Producent"}}))
-    measure("Cassandra", lambda: cass.execute("UPDATE producent SET nazwa = 'Nowy Producent' WHERE id = 999901;"))
+        self.log_result("UPDATE", "U6_Update_FK", *self.measure(
+            lambda p: pg_c.execute("UPDATE urzadzenie SET modelid = 2 WHERE przetargid = %s", p),
+            lambda p: my_c.execute("UPDATE urzadzenie SET modelid = 2 WHERE przetargid = %s", p),
+            lambda p: self.mo["urzadzenie"].update_many({"przetargid": p[0]}, {"$set": {"modelid": 2}}),
+            None,
+            lambda: (random.randint(1, 500),)
+        ))
 
-    print("\n[U6] Zmiana numeru seryjnego testowego urządzenia")
-    measure("Postgres", lambda: pg.cursor().execute("UPDATE urzadzenie SET numerseryjny = 'SN-NEW-99' WHERE id = 999901;"))
-    measure("MySQL", lambda: my_execute(my, "UPDATE urzadzenie SET numerseryjny = 'SN-NEW-99' WHERE id = 999901;"))
-    measure("Mongo", lambda: mongo["urzadzenie"].update_one({"id": 999901}, {"$set": {"numerseryjny": "SN-NEW-99"}}))
-    measure("Cassandra", lambda: cass.execute("UPDATE urzadzenie SET numerseryjny = 'SN-NEW-99' WHERE id = 999901;"))
+        # =====================================================================
+        # 4. DELETE (Podobnie jak Update - wyszukanie determinuje czas)
+        # =====================================================================
+        self.log_result("DELETE", "D1_Delete_By_Nazwa", *self.measure(
+            lambda p: pg_c.execute("DELETE FROM urzadzenie WHERE nazwa = %s", p),
+            lambda p: my_c.execute("DELETE FROM urzadzenie WHERE nazwa = %s", p),
+            lambda p: self.mo["urzadzenie"].delete_one({"nazwa": p[0]}),
+            None, # Ograniczenia architektoniczne Cassandry
+            lambda: (f"Urzadzenie-DEL-{random.randint(1, s)}",)
+        ))
 
-    print("\n" + "="*50)
-    print(" ROZPOCZYNAM TESTY: DELETE (Usuwanie)")
-    print("="*50)
+        self.log_result("DELETE", "D2_Mass_Delete_Stan", *self.measure(
+            lambda p: pg_c.execute("DELETE FROM urzadzenie WHERE stan = %s", p),
+            lambda p: my_c.execute("DELETE FROM urzadzenie WHERE stan = %s", p),
+            lambda p: self.mo["urzadzenie"].delete_many({"stan": p[0]}),
+            None,
+            lambda: ("Do usunięcia",) # Taki stan nie istnieje szeroko, chroni przed zniszczeniem bazy w trakcie testu
+        ))
 
-    #naprawa
-    print("\n[Czyszczenie pomocnicze przed D1] Usuwanie historii powiązanej z urządzeniem")
-    try: pg.cursor().execute("DELETE FROM historiaoperacji WHERE urzadzenieid = 999901;")
-    except: pass
-    try: my_execute(my, "DELETE FROM historiaoperacji WHERE urzadzenieid = 999901;")
-    except: pass
+        self.log_result("DELETE", "D3_Delete_By_PK", *self.measure(
+            lambda p: pg_c.execute("DELETE FROM budynek WHERE id = %s", p),
+            lambda p: my_c.execute("DELETE FROM budynek WHERE id = %s", p),
+            lambda p: self.mo["budynek"].delete_one({"id": p[0]}),
+            lambda p: self.ca.execute("DELETE FROM budynek WHERE id = %s", p),
+            lambda: (random.randint(10**9, 2*10**9),)
+        ))
 
-    print("\n[D1] Złomowanie testowego urządzenia (ID: 999901)")
-    measure("Postgres", lambda: pg.cursor().execute("DELETE FROM urzadzenie WHERE id = 999901;"))
-    measure("MySQL", lambda: my_execute(my, "DELETE FROM urzadzenie WHERE id = 999901;"))
-    measure("Mongo", lambda: mongo["urzadzenie"].delete_one({"id": 999901}))
-    measure("Cassandra", lambda: cass.execute("DELETE FROM urzadzenie WHERE id = 999901;"))
+        self.log_result("DELETE", "D4_Batch_Delete_50", *self.measure(
+            lambda p: psycopg2.extras.execute_batch(pg_c, "DELETE FROM budynek WHERE id = %s", p),
+            lambda p: my_c.executemany("DELETE FROM budynek WHERE id = %s", p),
+            None, 
+            lambda p: execute_concurrent_with_args(self.ca, self.cass_delete_budynek, p),
+            lambda: [(random.randint(10**9, 2*10**9),) for _ in range(50)]
+        ))
 
-    print("\n[D2] Usunięcie testowego pracownika (ID: 999901)")
-    measure("Postgres", lambda: pg.cursor().execute("DELETE FROM pracownik WHERE id = 999901;"))
-    measure("MySQL", lambda: my_execute(my, "DELETE FROM pracownik WHERE id = 999901;"))
-    measure("Mongo", lambda: mongo["pracownik"].delete_one({"id": 999901}))
-    measure("Cassandra", lambda: cass.execute("DELETE FROM pracownik WHERE id = 999901;"))
+        self.log_result("DELETE", "D5_Delete_Date_Range", *self.measure(
+            lambda p: pg_c.execute("DELETE FROM historiaoperacji WHERE data_zdarzenia < %s", p),
+            lambda p: my_c.execute("DELETE FROM historiaoperacji WHERE data_zdarzenia < %s", p),
+            lambda p: self.mo["historiaoperacji"].delete_many({"data_zdarzenia": {"$lt": p[0]}}),
+            None,
+            lambda: ("2019-01-01",)
+        ))
 
-    print("\n[D3] Usunięcie testowej karty dostępowej (ID: 999901)")
-    measure("Postgres", lambda: pg.cursor().execute("DELETE FROM karta WHERE id = 999901;"))
-    measure("MySQL", lambda: my_execute(my, "DELETE FROM karta WHERE id = 999901;"))
-    measure("Mongo", lambda: mongo["karta"].delete_one({"id": 999901}))
-    measure("Cassandra", lambda: cass.execute("DELETE FROM karta WHERE id = 999901;"))
+        self.log_result("DELETE", "D6_Delete_By_FK", *self.measure(
+            lambda p: pg_c.execute("DELETE FROM historiaoperacji WHERE pracownikid = %s", p),
+            lambda p: my_c.execute("DELETE FROM historiaoperacji WHERE pracownikid = %s", p),
+            lambda p: self.mo["historiaoperacji"].delete_many({"pracownikid": p[0]}),
+            None,
+            lambda: (random.randint(1, 5000),)
+        ))
 
-    print("\n[D4] Usunięcie testowego producenta (ID: 999901)")
-    measure("Postgres", lambda: pg.cursor().execute("DELETE FROM producent WHERE id = 999901;"))
-    measure("MySQL", lambda: my_execute(my, "DELETE FROM producent WHERE id = 999901;"))
-    measure("Mongo", lambda: mongo["producent"].delete_one({"id": 999901}))
-    measure("Cassandra", lambda: cass.execute("DELETE FROM producent WHERE id = 999901;"))
+        # Zapis do pliku
+        ts = datetime.now().strftime('%Y%m%d_%H%M%S')
+        fname = f"wyniki_{s}_{ts}.json"
+        with open(fname, 'w') as f:
+            json.dump(self.results, f, indent=4)
+        print(f"\n[ZAKOŃCZONO] Zapisano raport do pliku: {fname}")
+        
+        self.pg.close()
+        self.my.close()
+        self.ca.cluster.shutdown()
 
-    print("\n[D5] Usunięcie testowego działu (ID: 999901)")
-    measure("Postgres", lambda: pg.cursor().execute("DELETE FROM dzial WHERE id = 999901;"))
-    measure("MySQL", lambda: my_execute(my, "DELETE FROM dzial WHERE id = 999901;"))
-    measure("Mongo", lambda: mongo["dzial"].delete_one({"id": 999901}))
-    measure("Cassandra", lambda: cass.execute("DELETE FROM dzial WHERE id = 999901;"))
-
-    print("\n[D6] Wyburzenie testowego budynku (ID: 999901)")
-    measure("Postgres", lambda: pg.cursor().execute("DELETE FROM budynek WHERE id = 999901;"))
-    measure("MySQL", lambda: my_execute(my, "DELETE FROM budynek WHERE id = 999901;"))
-    measure("Mongo", lambda: mongo["budynek"].delete_one({"id": 999901}))
-    measure("Cassandra", lambda: cass.execute("DELETE FROM budynek WHERE id = 999901;"))
-
-# glowna petla
 if __name__ == "__main__":
-    print("Nawiązywanie połączeń z bazami...")
-    pg, my, mongo, cass = connect_all()
-    print("Połączenia nawiązane poprawnie!")
-    
-    run_tests(pg, my, mongo, cass)
-    
-    pg.close()
-    my.close()
-    cass.cluster.shutdown()
-    print("\n==================================================")
-    print(" TESTY ZAKOŃCZONE")
-    print("==================================================")
+    tester = DatabaseTester(CURRENT_SIZE)
+    tester.run()

@@ -56,7 +56,7 @@ def weryfikuj_stan_baz():
         cass = cluster.connect('it_equipment')
         cass.default_timeout = 60.0
         for tabela in TABELE:
-            liczba = cass.execute(f"SELECT COUNT(*) FROM {tabela};", timeout=300).one()[0]
+            liczba = cass.execute(f"SELECT COUNT(*) FROM {tabela};", timeout=None).one()[0]
             print(f"  - {tabela.ljust(20)} : {liczba} rekordów")
         cluster.shutdown()
     except Exception as e:
