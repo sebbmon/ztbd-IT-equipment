@@ -11,8 +11,7 @@ def connect_all():
     my.autocommit = True
     mongo = MongoClient("mongodb://admin:password@localhost:27017/?authSource=admin")["it_equipment"]
     
-    # Uwaga: Cassandra nie posiada instrukcji EXPLAIN (korzysta z Tracingu, który działa zupełnie inaczej), 
-    # więc dla czystości analizy planów zapytań skupiamy się na PG, MySQL i Mongo.
+    # Cassandra nie posiada instrukcji EXPLAIN - korzysta z Tracingu, który działa zupełnie inaczej
     return pg, my, mongo
 
 def analyze_postgres(pg, query):
@@ -38,7 +37,7 @@ def analyze_mysql(my, query):
             cur.execute(f"EXPLAIN FORMAT=JSON {query}")
             result = cur.fetchall()
             if result:
-                # Parsujemy JSON, żeby ładnie wyglądał w konsoli
+                # Parsujemy JSON
                 parsed = json.loads(result[0][0])
                 print(json.dumps(parsed, indent=2))
     except Exception as e:
@@ -56,7 +55,7 @@ def analyze_mongo(mongo, query_dict):
             verbosity="executionStats"
         )
         
-        # Wyciągamy tylko najważniejsze dane dla czytelności (żeby nie zalać konsoli ścianą tekstu)
+        # Wyciągamy tylko najważniejsze dane dla czytelności
         stats = explain_result.get("executionStats", {})
         plan = explain_result.get("queryPlanner", {}).get("winningPlan", {})
         
@@ -75,7 +74,7 @@ def analyze_mongo(mongo, query_dict):
 if __name__ == "__main__":
     pg, my, mongo = connect_all()
     
-    # Zapytanie analityczne używane w teście R3 (szukanie po dacie)
+    # Zapytanie analityczne używane w teście R3 - szukanie po dacie
     sql_query = "SELECT * FROM historiaoperacji WHERE data_zdarzenia > '2023-01-01 00:00:00' ORDER BY data_zdarzenia DESC LIMIT 100;"
     mongo_query = {"data_zdarzenia": {"$gt": "2023-01-01 00:00:00"}}
     
