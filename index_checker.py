@@ -22,7 +22,6 @@ def check_postgres(pg):
     print(" POSTGRESQL - AKTUALNE INDEKSY")
     print("="*50)
     cur = pg.cursor()
-    # pg_indexes to systemowy widok przechowujący definicje indeksów
     cur.execute("""
         SELECT tablename, indexname, indexdef 
         FROM pg_indexes 
@@ -41,7 +40,6 @@ def check_mysql(my):
     print(" MYSQL - AKTUALNE INDEKSY")
     print("="*50)
     cur = my.cursor()
-    # information_schema.STATISTICS przechowuje dane o indeksach
     cur.execute("""
         SELECT TABLE_NAME, INDEX_NAME, COLUMN_NAME, INDEX_TYPE 
         FROM information_schema.STATISTICS 
@@ -66,7 +64,6 @@ def check_mongo(mongo):
         indexes = mongo[coll].index_information()
         for index_name, index_info in indexes.items():
             has_indexes = True
-            # Klucz 'key' zawiera listę krotek np. [('id', 1)]
             keys = ", ".join([f"{k[0]} ({k[1]})" for k in index_info.get('key', [])])
             print(f"Kolekcja: {coll:<15} | Indeks: {index_name:<20} | Pola: {keys}")
             
@@ -77,7 +74,6 @@ def check_cassandra(cass):
     print("\n" + "="*50)
     print(" CASSANDRA - AKTUALNE INDEKSY (Secondary Indexes)")
     print("="*50)
-    # system_schema.indexes przechowuje informacje o dodatkowych indeksach (poza Primary Key)
     rows = cass.execute("""
         SELECT table_name, index_name, kind, options 
         FROM system_schema.indexes 
@@ -87,7 +83,6 @@ def check_cassandra(cass):
     if not rows_list:
         print("Brak dodatkowych indeksów (Secondary Indexes). Widoczne są tylko Primary Keys.")
     for row in rows_list:
-        # Cassandra w 'options' trzyma informację o tym, na jakiej kolumnie jest indeks (target)
         target = row.options.get('target', 'N/A')
         print(f"Tabela: {row.table_name:<15} | Indeks: {row.index_name:<25} | Kolumna: {target} | Typ: {row.kind}")
 
@@ -106,7 +101,6 @@ if __name__ == "__main__":
     except Exception as e:
         print(f"\nWystąpił błąd podczas sprawdzania indeksów: {e}")
     finally:
-        # Bezpieczne zamykanie połączeń
         if 'pg' in locals(): pg.close()
         if 'my' in locals(): my.close()
         if 'cass' in locals(): cass.cluster.shutdown()

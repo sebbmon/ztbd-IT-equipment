@@ -45,13 +45,12 @@ def drop_indexes(pg, my, mongo, cass):
             try:
                 cur.execute(f"ALTER TABLE {table} DROP INDEX {idx};")
             except mysql.connector.Error:
-                pass # Ignoruj, jeśli indeksu już nie ma
+                pass
                 
     # 3. MONGODB
     print(" -> Czyszczenie MongoDB...")
     cols_to_clear = ["urzadzenie", "historiaoperacji", "budynek", "pracownik"]
     for coll in cols_to_clear:
-        # Metoda drop_indexes() usuwa wszystkie indeksy oprócz wbudowanego '_id_'
         try:
             mongo[coll].drop_indexes()
         except Exception:
@@ -92,17 +91,15 @@ def create_indexes(pg, my, mongo, cass):
             try:
                 cur.execute(query)
             except mysql.connector.Error:
-                pass # Ignoruj, jeśli indeks już istnieje
+                pass
 
     # 3. MONGODB
     print(" -> Budowanie MongoDB (w tym naprawa architektury ID)...")
-    # Naprawa braku indeksów na kluczach głównych 'id' w naszej strukturze NoSQL
     mongo["urzadzenie"].create_index([("id", 1)], name="idx_urzadzenie_id")
     mongo["historiaoperacji"].create_index([("id", 1)], name="idx_historia_id")
     mongo["budynek"].create_index([("id", 1)], name="idx_budynek_id")
     mongo["pracownik"].create_index([("id", 1)], name="idx_pracownik_id")
     
-    # Indeksy biznesowe
     mongo["urzadzenie"].create_index([("nazwa", 1)], name="idx_urzadzenie_nazwa")
     mongo["urzadzenie"].create_index([("stan", 1)], name="idx_urzadzenie_stan")
     mongo["historiaoperacji"].create_index([("data_zdarzenia", 1)], name="idx_historia_data")

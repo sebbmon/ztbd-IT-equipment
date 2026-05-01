@@ -15,7 +15,7 @@ import sys
 # KONFIGURACJA TESTÓW
 # ==========================================
 REPEATS = 5
-# Ustawiamy rozmiar bazy podawany z konsoli, aby skrypt wiedział w jakim zakresie losować parametry
+
 try:
     CURRENT_SIZE = int(sys.argv[1])
 except IndexError:
@@ -41,7 +41,6 @@ class DatabaseTester:
         self.pg, self.my, self.mo, self.ca = connect_all()
         self.results = []
         
-        # Prekompilacja zapytań dla Cassandry (wymagane do operacji Batch)
         self.cass_insert_u = self.ca.prepare(
             "INSERT INTO urzadzenie (id, nazwa, przetargid, numerseryjny, stan, modelid) VALUES (?, ?, ?, ?, ?, ?)"
         )
@@ -63,7 +62,6 @@ class DatabaseTester:
                         func()
                     times.append((time.perf_counter() - start) * 1000)
                 except Exception as e:
-                    # TERA WYDRUKUJE NAM DOKŁADNY BŁĄD!
                     print(f"\n[BŁĄD {db_name.upper()}]: {e}")
                     return -1.0 
             return float(np.mean(times))
@@ -99,7 +97,6 @@ class DatabaseTester:
             c_params
         ))
 
-        # Przygotowanie danych do batcha poza stoperem
         def c_batch_params(): 
             return [(random.randint(60_000_001, 70_000_000), "Batch", 1, "SN", "Nowy", 1) for _ in range(500)]
         
@@ -111,7 +108,6 @@ class DatabaseTester:
             c_batch_params
         ))
 
-        # Dla oszczędności miejsca w kodzie, definiuję 4 pozostałe Create uproszczone
         self.log_result("CREATE", "C3_Insert_Historia", *self.measure(
             lambda p: pg_c.execute("INSERT INTO historiaoperacji (id, urzadzenieid) VALUES (%s, %s) ON CONFLICT DO NOTHING", p),
             lambda p: my_c.execute("INSERT IGNORE INTO historiaoperacji (id, urzadzenieid) VALUES (%s, %s)", p),
@@ -141,14 +137,13 @@ class DatabaseTester:
             lambda p: psycopg2.extras.execute_batch(pg_c, "INSERT INTO historiaoperacji (id, urzadzenieid) VALUES (%s, %s) ON CONFLICT DO NOTHING", p),
             lambda p: my_c.executemany("INSERT IGNORE INTO historiaoperacji (id, urzadzenieid) VALUES (%s, %s)", p),
             lambda p: self.mo["historiaoperacji"].insert_many([{"id": r[0], "urzadzenieid": r[1]} for r in p]),
-            None, # Pomijam Cassandrę dla zwięzłości w tym niszowym przypadku
+            None,
             c6_batch_hist
         ))
 
         # =====================================================================
         # 2. READ (Tutaj indeksy pokażą 1000x przyspieszenie!)
         # =====================================================================
-        # R1: Unikalny tekst (wysoka kardynalność). Bez indeksu: dramat. Z indeksem: ułamek sekundy.
         self.log_result("READ", "R1_Search_By_Nazwa", *self.measure(
             lambda p: pg_c.execute("SELECT * FROM urzadzenie WHERE nazwa = %s", p) or pg_c.fetchall(),
             lambda p: my_c.execute("SELECT * FROM urzadzenie WHERE nazwa = %s", p) or my_c.fetchall(),
@@ -157,7 +152,6 @@ class DatabaseTester:
             lambda: (f"Urzadzenie-{random.randint(1, s)}",)
         ))
 
-        # R2: Kategoria (niska kardynalność).
         self.log_result("READ", "R2_Search_By_Stan", *self.measure(
             lambda p: pg_c.execute("SELECT * FROM urzadzenie WHERE stan = %s LIMIT 500", p) or pg_c.fetchall(),
             lambda p: my_c.execute("SELECT * FROM urzadzenie WHERE stan = %s LIMIT 500", p) or my_c.fetchall(),
@@ -166,16 +160,14 @@ class DatabaseTester:
             lambda: (random.choice(['Nowy', 'W naprawie', 'Zmagazynowany']),)
         ))
 
-        # R3: Sortowanie i Data (Zabójca wydajności bez indeksu)
         self.log_result("READ", "R3_Date_Range_Sort", *self.measure(
             lambda p: pg_c.execute("SELECT * FROM historiaoperacji WHERE data_zdarzenia > %s ORDER BY data_zdarzenia DESC LIMIT 100", p) or pg_c.fetchall(),
             lambda p: my_c.execute("SELECT * FROM historiaoperacji WHERE data_zdarzenia > %s ORDER BY data_zdarzenia DESC LIMIT 100", p) or my_c.fetchall(),
             lambda p: list(self.mo["historiaoperacji"].find({"data_zdarzenia": {"$gt": p[0]}}).sort("data_zdarzenia", -1).limit(100)),
-            None, # Cassandra nie pozwala na relacyjne sortowanie zakresów bez specyficznego klucza klastrującego
+            None,
             lambda: (f"{random.randint(2021, 2023)}-01-01 00:00:00",)
         ))
 
-        # R4: Podstawowy JOIN (Relacyjne vs NoSQL manual join)
         self.log_result("READ", "R4_Join_Urzadz_Model", *self.measure(
             lambda p: pg_c.execute("SELECT u.nazwa, m.nazwa FROM urzadzenie u JOIN model m ON u.modelid = m.id WHERE u.id = %s", p) or pg_c.fetchall(),
             lambda p: my_c.execute("SELECT u.nazwa, m.nazwa FROM urzadzenie u JOIN model m ON u.modelid = m.id WHERE u.id = %s", p) or my_c.fetchall(),
@@ -184,16 +176,14 @@ class DatabaseTester:
             lambda: (random.randint(1, s),)
         ))
 
-        # R5: Agregacja z filtrem
         self.log_result("READ", "R5_Count_By_Stan", *self.measure(
             lambda p: pg_c.execute("SELECT COUNT(*) FROM urzadzenie WHERE stan = %s", p) or pg_c.fetchall(),
             lambda p: my_c.execute("SELECT COUNT(*) FROM urzadzenie WHERE stan = %s", p) or my_c.fetchall(),
             lambda p: self.mo["urzadzenie"].count_documents({"stan": p[0]}),
-            None, # Cassandra Full Scan Count wyrzuci timeout przy milionach
+            None,
             lambda: (random.choice(['Nowy', 'W naprawie']),)
         ))
 
-        # R6: Pobranie po PK (Zawsze ma indeks! Służy jako linia bazowa - Baseline)
         self.log_result("READ", "R6_Read_By_PK", *self.measure(
             lambda p: pg_c.execute("SELECT * FROM urzadzenie WHERE id = %s", p) or pg_c.fetchall(),
             lambda p: my_c.execute("SELECT * FROM urzadzenie WHERE id = %s", p) or my_c.fetchall(),
@@ -205,7 +195,6 @@ class DatabaseTester:
         # =====================================================================
         # 3. UPDATE (Szukanie rekordu zajmuje 99% czasu, zmiana 1%)
         # =====================================================================
-        # U1: Update masowy po statusie
         self.log_result("UPDATE", "U1_Mass_Update_Stan", *self.measure(
             lambda p: pg_c.execute("UPDATE urzadzenie SET stan = 'X' WHERE stan = %s", p),
             lambda p: my_c.execute("UPDATE urzadzenie SET stan = 'X' WHERE stan = %s", p),
@@ -214,7 +203,6 @@ class DatabaseTester:
             lambda: (random.choice(['W użyciu', 'Zmagazynowany']),)
         ))
 
-        # U2: Update jednego rekordu ale po nazwie (szukanie bez indeksu boli)
         self.log_result("UPDATE", "U2_Update_By_Nazwa", *self.measure(
             lambda p: pg_c.execute("UPDATE urzadzenie SET stan = 'Naprawa' WHERE nazwa = %s", p),
             lambda p: my_c.execute("UPDATE urzadzenie SET stan = 'Naprawa' WHERE nazwa = %s", p),
@@ -223,7 +211,6 @@ class DatabaseTester:
             lambda: (f"Urzadzenie-{random.randint(1, s)}",)
         ))
 
-        # U3: Update po PK (Linia bazowa)
         self.log_result("UPDATE", "U3_Update_By_PK", *self.measure(
             lambda p: pg_c.execute("UPDATE urzadzenie SET stan = 'Y' WHERE id = %s", p),
             lambda p: my_c.execute("UPDATE urzadzenie SET stan = 'Y' WHERE id = %s", p),
@@ -243,7 +230,7 @@ class DatabaseTester:
         self.log_result("UPDATE", "U5_Batch_PK_50", *self.measure(
             lambda p: psycopg2.extras.execute_batch(pg_c, "UPDATE urzadzenie SET stan = 'B' WHERE id = %s", p),
             lambda p: my_c.executemany("UPDATE urzadzenie SET stan = 'B' WHERE id = %s", p),
-            None, # pymongo używa bulk_write, pominąłem dla uproszczenia
+            None,
             None,
             lambda: [(random.randint(1, s),) for _ in range(50)]
         ))
@@ -263,7 +250,7 @@ class DatabaseTester:
             lambda p: pg_c.execute("DELETE FROM urzadzenie WHERE nazwa = %s", p),
             lambda p: my_c.execute("DELETE FROM urzadzenie WHERE nazwa = %s", p),
             lambda p: self.mo["urzadzenie"].delete_one({"nazwa": p[0]}),
-            None, # Ograniczenia architektoniczne Cassandry
+            None,
             lambda: (f"Urzadzenie-DEL-{random.randint(1, s)}",)
         ))
 
@@ -272,7 +259,7 @@ class DatabaseTester:
             lambda p: my_c.execute("DELETE FROM urzadzenie WHERE stan = %s", p),
             lambda p: self.mo["urzadzenie"].delete_many({"stan": p[0]}),
             None,
-            lambda: ("Do usunięcia",) # Taki stan nie istnieje szeroko, chroni przed zniszczeniem bazy w trakcie testu
+            lambda: ("Do usunięcia",)
         ))
 
         self.log_result("DELETE", "D3_Delete_By_PK", *self.measure(
